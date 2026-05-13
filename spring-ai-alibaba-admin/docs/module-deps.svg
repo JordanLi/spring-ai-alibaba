@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xml:lang="zh-CN" width="720" height="440" viewBox="0 0 720 440">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f8fafc"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#64748b"/>
+    </marker>
+  </defs>
+  <rect width="100%" height="100%" fill="url(#bg)"/>
+  <text x="360" y="36" text-anchor="middle" font-family="system-ui,sans-serif" font-size="17" font-weight="700" fill="#0f172a">spring-ai-alibaba-admin &#27169;&#22359;&#20381;&#36182;</text>
+  <text x="360" y="58" text-anchor="middle" font-family="system-ui,sans-serif" font-size="11" fill="#64748b">&#31614;&#22836;&#25351;&#21521;&#34987;&#20381;&#36182;&#30340; artifact&#65288;Maven compile &#26041;&#21521;&#65289;</text>
+
+  <!-- server-start -->
+  <rect x="260" y="90" width="200" height="56" rx="10" fill="#1d4ed8" stroke="#1e3a8a" stroke-width="2"/>
+  <text x="360" y="118" text-anchor="middle" font-family="Menlo,Consolas,monospace" font-size="12" font-weight="700" fill="#ffffff">server-start</text>
+  <text x="360" y="136" text-anchor="middle" font-family="system-ui,sans-serif" font-size="10" fill="#dbeafe">Spring Boot &#21487;&#25191;&#34892;&#20837;&#21475;</text>
+
+  <!-- server-openapi -->
+  <rect x="40" y="240" width="180" height="52" rx="10" fill="#0f766e" stroke="#115e59" stroke-width="2"/>
+  <text x="130" y="268" text-anchor="middle" font-family="Menlo,Consolas,monospace" font-size="11.5" font-weight="700" fill="#ffffff">server-openapi</text>
+  <text x="130" y="284" text-anchor="middle" font-family="system-ui,sans-serif" font-size="9.5" fill="#ccfbf1">/api/v1/apps &#31561; REST</text>
+
+  <!-- server-core -->
+  <rect x="270" y="240" width="180" height="52" rx="10" fill="#7c3aed" stroke="#5b21b6" stroke-width="2"/>
+  <text x="360" y="268" text-anchor="middle" font-family="Menlo,Consolas,monospace" font-size="11.5" font-weight="700" fill="#ffffff">server-core</text>
+  <text x="360" y="284" text-anchor="middle" font-family="system-ui,sans-serif" font-size="9.5" fill="#ede9fe">&#39046;&#22495;&#19982;&#25968;&#25454;&#23618;&#19994;&#21153;</text>
+
+  <!-- server-runtime -->
+  <rect x="500" y="240" width="180" height="52" rx="10" fill="#b45309" stroke="#92400e" stroke-width="2"/>
+  <text x="590" y="268" text-anchor="middle" font-family="Menlo,Consolas,monospace" font-size="11.5" font-weight="700" fill="#ffffff">server-runtime</text>
+  <text x="590" y="284" text-anchor="middle" font-family="system-ui,sans-serif" font-size="9.5" fill="#fef3c7">&#36816;&#34892;&#26399;&#27169;&#22411;&#19982;&#20849;&#36890;&#24037;&#20855;</text>
+
+  <!-- start -> openapi / core / runtime -->
+  <line x1="320" y1="146" x2="130" y2="238" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="360" y1="146" x2="360" y2="238" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="400" y1="146" x2="590" y2="238" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- openapi -> core -->
+  <line x1="220" y1="266" x2="270" y2="266" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- core -> runtime: spring-ai-alibaba-admin-server-core depends on server-runtime -->
+  <line x1="450" y1="266" x2="500" y2="266" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <text x="360" y="360" text-anchor="middle" font-family="system-ui,sans-serif" font-size="10" fill="#475569">start &#8594; core&#12289;openapi&#12289;runtime&#65307;openapi &#8594; core&#65307;core &#8594; runtime&#65288;runtime &#19981;&#21453;&#21521;&#20381;&#36182; core&#65289;</text>
+</svg>
