@@ -16,6 +16,15 @@
 # spring-ai-alibaba-admin 子项目的构建 + 测试流水线。
 # 说明：admin 子项目是一个独立的 Maven reactor（未挂在仓库根 pom 的 <modules> 下），
 # 根工作流 build-and-test.yml 跑不到它，因此单独建此 workflow 兜底。
+#
+# 当前测试套件全部为纯单元 / Characterization 测试（Mockito，无 @SpringBootTest /
+# Testcontainers），不依赖任何中间件，所以这里只做 build + test，跑得快也更稳。
+#
+# 待将来补上需要真实 DB/ES/RocketMQ 的集成测试（test-plan 的 B5 等）时，再按需用
+# docker-compose.dev.yml 把中间件挂回来。届时注意 RocketMQ broker 在全新命名卷
+# (rmq_store) 上以 user 3000:3000 启动会因卷属主为 root 而初始化失败
+# （BrokerStartup.createBrokerController 失败 -> shutdown 时抛 ScheduleMessageService NPE），
+# 需要先 chown 卷或改用容器内置存储路径。
 name: 🧪 Admin Test
 
 # 触发：推送到任意分支 + 任何指向本仓库的 PR
@@ -32,7 +41,7 @@ concurrency:
   group: admin-test-${{ github.ref }}
   cancel-in-progress: true
 
-# 所有 `run` 步骤默认在 admin 子目录执行（compose 文件里的 ./docker/middleware 相对路径依赖此工作目录）
+# 所有 `run` 步骤默认在 admin 子目录执行
 defaults:
   run:
     working-directory: spring-ai-alibaba-admin
@@ -41,7 +50,7 @@ jobs:
   build-and-test:
     name: Build & Test (JDK 17)
     runs-on: ubuntu-22.04
-    timeout-minutes: 40
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,21 +62,6 @@ jobs:
           distribution: temurin
           java-version: '17'
           cache: maven
-
-      # Elasticsearch 需要较大的 mmap 计数，CI runner 默认值偏低，先抬高避免 ES 起不来
-      - name: Raise vm.max_map_count for Elasticsearch
-        run: sudo sysctl -w vm.max_map_count=262144
-        working-directory: .
-
-      # 复用 docker-compose.dev.yml 拉起测试所需中间件（跳过纯观测用途的 kibana / loongcollector 以加速）。
-      # --wait 会阻塞到长驻服务 healthy、一次性初始化容器（es 建索引 / rmq 建 topic）成功退出。
-      - name: Start middleware (docker compose)
-        run: |
-          docker compose -f docker-compose.dev.yml up -d --wait --wait-timeout 420 \
-            mysql redis elasticsearch elasticsearch-init nacos \
-            rmq_namesrv rmq_broker rmq_proxy init-topic
-          echo "----- middleware status -----"
-          docker compose -f docker-compose.dev.yml ps
 
       # 核心步骤：mvn clean test。任一测试失败 -> 步骤失败 -> job 失败 -> 该检查变红。
       # 把此检查设为分支保护的 required check，即可“失败就 block merge”（见文件末尾说明）。
@@ -84,13 +78,3 @@ jobs:
             spring-ai-alibaba-admin/**/target/surefire-reports/**
           retention-days: 7
           if-no-files-found: warn
-
-      # 打印失败容器日志，便于排查中间件问题
-      - name: Dump middleware logs on failure
-        if: ${{ failure() }}
-        run: docker compose -f docker-compose.dev.yml logs --tail 200
-
-      # 始终清理中间件与数据卷
-      - name: Tear down middleware
-        if: ${{ always() }}
-        run: docker compose -f docker-compose.dev.yml down -v
