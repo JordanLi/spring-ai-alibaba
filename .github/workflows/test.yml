@@ -1,0 +1,96 @@
+#
+# Copyright 2025-2026 the original author or authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# spring-ai-alibaba-admin 子项目的构建 + 测试流水线。
+# 说明：admin 子项目是一个独立的 Maven reactor（未挂在仓库根 pom 的 <modules> 下），
+# 根工作流 build-and-test.yml 跑不到它，因此单独建此 workflow 兜底。
+name: 🧪 Admin Test
+
+# 触发：推送到任意分支 + 任何指向本仓库的 PR
+on:
+  push:
+  pull_request:
+
+# 只读权限即可（仅跑测试 + 传 artifact）
+permissions:
+  contents: read
+
+# 同一分支/PR 的新提交取消仍在跑的旧任务，省时省资源
+concurrency:
+  group: admin-test-${{ github.ref }}
+  cancel-in-progress: true
+
+# 所有 `run` 步骤默认在 admin 子目录执行（compose 文件里的 ./docker/middleware 相对路径依赖此工作目录）
+defaults:
+  run:
+    working-directory: spring-ai-alibaba-admin
+
+jobs:
+  build-and-test:
+    name: Build & Test (JDK 17)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 对应 pom.xml 里的 <java.version>17</java.version>；内置 Maven 依赖缓存（~/.m2，按 pom.xml 哈希作 key）
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      # Elasticsearch 需要较大的 mmap 计数，CI runner 默认值偏低，先抬高避免 ES 起不来
+      - name: Raise vm.max_map_count for Elasticsearch
+        run: sudo sysctl -w vm.max_map_count=262144
+        working-directory: .
+
+      # 复用 docker-compose.dev.yml 拉起测试所需中间件（跳过纯观测用途的 kibana / loongcollector 以加速）。
+      # --wait 会阻塞到长驻服务 healthy、一次性初始化容器（es 建索引 / rmq 建 topic）成功退出。
+      - name: Start middleware (docker compose)
+        run: |
+          docker compose -f docker-compose.dev.yml up -d --wait --wait-timeout 420 \
+            mysql redis elasticsearch elasticsearch-init nacos \
+            rmq_namesrv rmq_broker rmq_proxy init-topic
+          echo "----- middleware status -----"
+          docker compose -f docker-compose.dev.yml ps
+
+      # 核心步骤：mvn clean test。任一测试失败 -> 步骤失败 -> job 失败 -> 该检查变红。
+      # 把此检查设为分支保护的 required check，即可“失败就 block merge”（见文件末尾说明）。
+      - name: Run mvn clean test
+        run: mvn -B -ntp clean test
+
+      # 无论成败都收集测试报告到 artifact 区，方便 review（surefire 的 .txt/.xml）
+      - name: Upload test reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: |
+            spring-ai-alibaba-admin/**/target/surefire-reports/**
+          retention-days: 7
+          if-no-files-found: warn
+
+      # 打印失败容器日志，便于排查中间件问题
+      - name: Dump middleware logs on failure
+        if: ${{ failure() }}
+        run: docker compose -f docker-compose.dev.yml logs --tail 200
+
+      # 始终清理中间件与数据卷
+      - name: Tear down middleware
+        if: ${{ always() }}
+        run: docker compose -f docker-compose.dev.yml down -v
