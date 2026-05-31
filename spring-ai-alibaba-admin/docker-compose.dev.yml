@@ -1,0 +1,298 @@
+# docker-compose.dev.yml
+#
+# 全 Docker 版本地依赖编排：把 spring-ai-alibaba-admin 所需的全部中间件
+# （MySQL / Redis / Elasticsearch / Kibana / Nacos / RocketMQ / LoongCollector）
+# 一次性打包成容器。偏好纯 Docker 的同学可以用这个替代
+# “brew(MySQL/Redis) + docker(其余)” 的混合方式。
+#
+# 用法（在项目根目录执行）：
+#   启动全部：     docker compose -f docker-compose.dev.yml up -d
+#   查看状态：     docker compose -f docker-compose.dev.yml ps
+#   跟踪初始化日志：docker compose -f docker-compose.dev.yml logs -f elasticsearch-init init-topic
+#   停止：         docker compose -f docker-compose.dev.yml stop
+#   彻底清理(含数据卷)：docker compose -f docker-compose.dev.yml down -v
+#
+# 说明：
+#   - 版本号、端口、初始化脚本与 docker/middleware/docker-compose-prod.yaml 对齐。
+#   - 数据使用命名卷（named volume），避免宿主机目录权限问题；初始化脚本/配置以
+#     只读 bind mount 方式挂载自 ./docker/middleware。
+#   - RocketMQ 容器固定以镜像内置用户 3000:3000 运行（apache/rocketmq:5.3.2 的
+#     bin/*.sh 权限是 750，用宿主机 UID 会读不到脚本导致死循环重启）。
+#   - 启动顺序：ES -> ES 索引初始化 -> Nacos(healthy) -> LoongCollector；
+#     RocketMQ namesrv/broker(healthy) -> proxy / init-topic。
+#   - 首次启动需等 elasticsearch-init 与 rmq-init-topic 两个一次性容器 Exited(0)。
+
+services:
+  # ─── MySQL 8.0：建 admin 库 + admin/admin 用户，自动执行 init/mysql/*.sql ───
+  mysql:
+    image: sca-registry.cn-hangzhou.cr.aliyuncs.com/dubbo/mysql:8.0.35
+    container_name: saa-dev-mysql
+    restart: always
+    env_file:
+      - ./docker/middleware/mysql.env
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/middleware/conf/mysql:/etc/mysql/conf.d:ro
+      - ./docker/middleware/init/mysql:/docker-entrypoint-initdb.d/:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+    networks:
+      - saa-dev
+
+  # ─── Redis 7.2 ───
+  redis:
+    image: redis:7.2.5
+    container_name: saa-dev-redis
+    restart: always
+    command: ["redis-server", "--save", "60", "1"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - saa-dev
+
+  # ─── Elasticsearch 9.1.2（单节点，关闭安全，dev 低内存）───
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.1.2
+    container_name: saa-dev-elasticsearch
+    restart: always
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - cluster.name=es-cluster
+      - node.name=es-node-1
+      - bootstrap.memory_lock=false
+      - http.cors.enabled=true
+      - http.cors.allow-origin="*"
+      - action.destructive_requires_name=false
+      - xpack.ml.enabled=false
+      - ingest.geoip.downloader.enabled=false
+    ulimits:
+      memlock:
+        soft: 0
+        hard: 0
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - saa-dev
+
+  # ─── Kibana 9.1.2 ───
+  kibana:
+    image: docker.elastic.co/kibana/kibana:9.1.2
+    container_name: saa-dev-kibana
+    restart: always
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - xpack.security.enabled=false
+      - NODE_OPTIONS=--max-old-space-size=768
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - saa-dev
+
+  # ─── ES 初始化（一次性）：创建 parsing_loongsuite_traces pipeline + loongsuite_traces 索引 ───
+  elasticsearch-init:
+    image: curlimages/curl:8.11.1
+    container_name: saa-dev-es-init
+    restart: "no"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - ./docker/middleware/init/elasticsearch:/scripts:ro
+    working_dir: /scripts
+    command: ["sh", "init-indices.sh"]
+    networks:
+      - saa-dev
+
+  # ─── Nacos 3.x（standalone，嵌入式存储）───
+  # 7080->8080 console，7848->8848 API(gRPC/HTTP)，8848->9848 gRPC
+  nacos:
+    image: nacos/nacos-server:v3.2.1
+    container_name: saa-dev-nacos
+    restart: always
+    environment:
+      - MODE=standalone
+      - NACOS_AUTH_TOKEN=dG9rZW5hbHNka2ZqbGFza2RqZmxhc2tkamZsYXNrZGpmb3dpZWpmbztzZGxm
+      - NACOS_AUTH_IDENTITY_KEY=admin
+      - NACOS_AUTH_IDENTITY_VALUE=admin
+    ports:
+      - "7080:8080"
+      - "7848:8848"
+      - "8848:9848"
+    volumes:
+      - nacos_logs:/home/nacos/logs
+      - nacos_data:/home/nacos/data
+    healthcheck:
+      # Nacos 镜像自带 bash，用 /dev/tcp 探测 console 端口是否就绪
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/127.0.0.1/8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    networks:
+      - saa-dev
+
+  # ─── LoongCollector 3.1.4（OTLP Receiver，:4318）───
+  # 显式依赖 Nacos healthy：Collector 可能用 Nacos 做服务发现，必须在 Nacos 之后启动。
+  loongcollector:
+    image: sls-opensource-registry.cn-shanghai.cr.aliyuncs.com/loongcollector-community-edition/loongcollector:3.1.4
+    container_name: saa-dev-loongcollector
+    restart: always
+    depends_on:
+      elasticsearch-init:
+        condition: service_completed_successfully
+      nacos:
+        condition: service_healthy
+    volumes:
+      - ./docker/middleware/conf/loongcollector:/usr/local/loongcollector/conf/continuous_pipeline_config/local:ro
+    ports:
+      - "4318:4318"
+    networks:
+      - saa-dev
+
+  # ─── RocketMQ 5.3.2 NameServer ───
+  rmq_namesrv:
+    image: apache/rocketmq:5.3.2
+    container_name: saa-dev-rmq-namesrv
+    restart: always
+    user: "3000:3000"
+    environment:
+      - NAMESRV_ADDR=rmq_namesrv:9876
+      - HEAP_OPTS=-Xms128M -Xmx256M -Xmn128M
+      - TZ=Asia/Shanghai
+    ports:
+      - "9876:9876"
+    command: sh mqnamesrv
+    healthcheck:
+      test: ["CMD", "sh", "-c", "ps aux | grep mqnamesrv | grep -v grep || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - saa-dev
+
+  # ─── RocketMQ 5.3.2 Broker ───
+  rmq_broker:
+    image: apache/rocketmq:5.3.2
+    container_name: saa-dev-rmq-broker
+    restart: always
+    user: "3000:3000"
+    environment:
+      - NAMESRV_ADDR=rmq_namesrv:9876
+      - HEAP_OPTS=-Xms256M -Xmx512M -Xmn256M -XX:MaxDirectMemorySize=128M
+      - TZ=Asia/Shanghai
+    volumes:
+      - rmq_store:/home/rocketmq/store
+    ports:
+      - "10909:10909"
+      - "10911:10911"
+      - "10912:10912"
+    depends_on:
+      - rmq_namesrv
+    command: sh mqbroker
+    healthcheck:
+      test: ["CMD", "sh", "-c", "ps aux | grep mqbroker | grep -v grep || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - saa-dev
+
+  # ─── RocketMQ 5.3.2 Proxy（gRPC，:18080）───
+  rmq_proxy:
+    image: apache/rocketmq:5.3.2
+    container_name: saa-dev-rmq-proxy
+    restart: always
+    user: "3000:3000"
+    environment:
+      - NAMESRV_ADDR=rmq_namesrv:9876
+      - HEAP_OPTS=-Xms128M -Xmx256M -Xmn128M
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./docker/middleware/conf/rocketmq:/home/rocketmq/conf:ro
+    ports:
+      - "18080:18080"
+      - "18081:18081"
+    depends_on:
+      - rmq_namesrv
+      - rmq_broker
+    command: sh mqproxy -pc /home/rocketmq/conf/rmq-proxy.json
+    networks:
+      - saa-dev
+
+  # ─── RocketMQ 初始化（一次性）：建 topic + consumer group ───
+  init-topic:
+    image: apache/rocketmq:5.3.2
+    container_name: saa-dev-rmq-init-topic
+    restart: "no"
+    user: "3000:3000"
+    depends_on:
+      rmq_namesrv:
+        condition: service_healthy
+      rmq_broker:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+        echo 'Waiting for RocketMQ to be ready...' &&
+        sleep 30 &&
+        until sh mqadmin clusterList -n rmq_namesrv:9876; do
+          echo 'Waiting for RocketMQ to be fully ready...' &&
+          sleep 10
+        done &&
+        echo 'Creating topic...' &&
+        sh mqadmin updateTopic -n rmq_namesrv:9876 -t topic_saa_studio_document_index -c DefaultCluster -a +message.type=NORMAL &&
+        sh mqadmin updateSubGroup -n rmq_namesrv:9876 -g group_saa_studio_document_index -c DefaultCluster &&
+        echo 'Verifying topic creation...' &&
+        sh mqadmin topicList -n rmq_namesrv:9876 &&
+        echo 'Topic creation completed'"
+    networks:
+      - saa-dev
+
+volumes:
+  mysql_data:
+    driver: local
+  redis_data:
+    driver: local
+  es_data:
+    driver: local
+  nacos_data:
+    driver: local
+  nacos_logs:
+    driver: local
+  rmq_store:
+    driver: local
+
+networks:
+  saa-dev:
+    driver: bridge

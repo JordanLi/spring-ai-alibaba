@@ -1,0 +1,236 @@
+---
+name: docs-auto-sync
+description: >-
+  Read-only audit that detects drift between live code (Controllers,
+  Entities/DOs, Mapper XML, DDL schema sql) and the two living docs in
+  spring-ai-alibaba-admin: docs/api-list.md and docs/data-model.md. Produces
+  ONE structured inconsistency report and nothing else; never writes,
+  renames, or deletes any file. Use when the user says 检查文档是否过期,
+  文档跟代码对不上, 同步文档, docs drift, sync docs, verify api docs,
+  verify data model docs, after merging a controller / mapper / entity /
+  DDL change, or as a PR pre-flight check. Output sections cover endpoints
+  in code but missing from api-list.md, endpoints in api-list.md with no
+  matching @RequestMapping/@GetMapping/etc. method, tables in *-schema.sql
+  missing from data-model.md, fields whose SQL type / nullability /
+  cardinality disagree between Entity, DDL and doc, plus a copy-pastable
+  patch snippet for each item. All resolution decisions stay with the
+  human; the skill ends after printing the report.
+allowed-tools: [Read, Glob, Grep]
+---
+
+# Docs Auto-Sync (read-only drift audit)
+
+## What this skill does
+
+Compares the **code** in `spring-ai-alibaba-admin` against the two doc files
+that humans read to understand the system, and prints a structured drift
+report:
+
+- `docs/api-list.md` ←→ `*Controller.java`
+- `docs/data-model.md` ←→ `*DO.java` / `*Entity.java` / `docker/middleware/init/mysql/*-schema.sql`
+
+The output is a markdown report **only**. The skill exits with a "0 files
+modified" line so the user knows nothing was changed behind their back.
+
+## What this skill explicitly does NOT do
+
+Hard contract — violating any of these means the skill is broken, not
+"helpful":
+
+- ❌ No `Write`, no `StrReplace`, no `Shell`. The `allowed-tools` list
+  enforces this at the tool layer.
+- ❌ Never propose a `git commit`, never suggest running `mvn` / `make`,
+  never trigger downstream skills (`scaffold-resource`, etc.).
+- ❌ Never auto-apply a "fix" even when the fix is obviously one-line
+  trivial.
+- ✅ Allowed: include the exact text snippet the user could paste, clearly
+  fenced and labelled `suggested patch (paste manually)`.
+
+If the user, after seeing the report, asks "go ahead and fix it", **stop
+this skill** and switch to a write-capable skill (e.g. `scaffold-resource`
+for new tables, or plain edits). Do not silently extend this skill's scope.
+
+## Inputs to gather
+
+Ask in **one** consolidated round; if the user gave no input at all,
+proceed with the defaults below.
+
+| Parameter | Required? | Default | Notes |
+|-----------|-----------|---------|-------|
+| `scope` | no | `both` | `api` / `data` / `both` |
+| `since` | no | (full scan) | git ref like `HEAD~10` or a date; narrows the audit to recently-touched files only — purely advisory, the skill itself does not call git |
+| `domain` | no | `both` | `admin` / `studio` / `both` (filter to one persistence convention) |
+| `severity_floor` | no | `info` | `info` / `warn` / `error` — hide items below this level |
+
+Don't ask follow-ups for missing optional inputs. Just print which defaults
+you applied at the top of the report.
+
+## Sources of truth
+
+Live code (authoritative):
+
+| What | Where |
+|------|-------|
+| Admin REST endpoints | `spring-ai-alibaba-admin-server-start/src/main/java/com/alibaba/cloud/ai/studio/admin/controller/*Controller.java` |
+| Studio REST endpoints | `spring-ai-alibaba-admin-server-start/src/main/java/com/alibaba/cloud/ai/studio/admin/builder/controller/*Controller.java` |
+| Admin entities | `spring-ai-alibaba-admin-server-start/src/main/java/com/alibaba/cloud/ai/studio/admin/entity/*DO.java` |
+| Studio entities | `spring-ai-alibaba-admin-server-core/src/main/java/com/alibaba/cloud/ai/studio/core/base/entity/*Entity.java` |
+| Admin DDL | `docker/middleware/init/mysql/admin-schema.sql` |
+| Studio DDL | `docker/middleware/init/mysql/agentscope-schema.sql` |
+
+Doc files (audit targets):
+
+- `docs/api-list.md` — endpoint list grouped by resource
+- `docs/data-model.md` — table list grouped by domain (§2 admin, §3 studio,
+  §4.1 entities without a single matching table)
+
+## Workflow
+
+Run steps strictly in order. After each step print the count of items found
+so the user can follow progress.
+
+| # | Step | Tool | Concrete action |
+|---|------|------|-----------------|
+| 1 | Confirm inputs | (chat) | Print resolved `scope` / `domain` / `since` / `severity_floor` once. Do not ask follow-ups for optional fields. |
+| 2 | Enumerate code endpoints | `Glob` + `Read` | Glob the two controller dirs. For each `*Controller.java`, extract: class-level `@RequestMapping` prefix, method-level `@GetMapping/@PostMapping/@PutMapping/@DeleteMapping/@RequestMapping` value, HTTP verb, method name, return type. Store as `(verb, full_path, controller_class, method_name)`. |
+| 3 | Enumerate doc endpoints | `Read` + `Grep` | Read `docs/api-list.md`. Parse every endpoint row (markdown table rows starting with HTTP verb or with `\| <verb> \| <path>` shape, plus any inline `### <verb> <path>` headings). Store as `(verb, full_path, section_title, line_no)`. |
+| 4 | Diff endpoints | (in-memory) | Produce three lists: (a) **MISSING_IN_DOC** — in code, not in doc; (b) **MISSING_IN_CODE** — in doc, not in code (dead doc); (c) **MISMATCH** — same `(verb, path)` but conflicting parameter / response shape. For (c) only flag the easy-to-detect cases: differing HTTP verb on same path, differing path-variable names, request-body class renamed. Do NOT try to deep-diff field-level request bodies — too noisy. |
+| 5 | Enumerate code tables | `Glob` + `Read` | Read both `*-schema.sql` files; parse every `CREATE TABLE` block into `(table_name, [(column, sql_type, nullable, default, comment)])`. Read every `*DO.java` / `*Entity.java`; parse fields via Lombok / JPA / MyBatis-Plus annotations into `(java_field, java_type, column_name_if_annotated)`. |
+| 6 | Enumerate doc tables | `Read` | Parse `docs/data-model.md` section by section. Pick up `### x.y <table_name>（<cn name>）` subsection headers and the immediately-following `字段 \| SQL 类型 \| 说明` table rows. Store as `(table_name, [(column, sql_type, description)])`. |
+| 7 | Diff data model | (in-memory) | Produce four lists: (a) **TABLE_MISSING_IN_DOC** — in DDL, not documented; (b) **TABLE_MISSING_IN_DDL** — documented but no `CREATE TABLE` (cross-reference §4.1 "no single table" entries — those are not bugs, only flag truly orphaned tables); (c) **FIELD_MISSING_IN_DOC** — column in DDL but not in doc table; (d) **FIELD_TYPE_MISMATCH** — column present in both but `sql_type` string differs (case-insensitive, with `BIGINT(20)` == `BIGINT` normalization). |
+| 8 | Cross-check Entity ↔ DDL | (in-memory) | For each table, line up DDL columns against entity fields. Flag: column in DDL not mapped on entity, entity field with `@Column`/`@TableField` pointing to a non-existent column. Skip the conventional bookkeeping columns (`id`, `gmt_create`, `gmt_modified`, `create_time`, `update_time`, `workspace_id`, `deleted`, `status`) unless they themselves disagree. |
+| 9 | Assemble report | (in-memory) | Render the report in the format below. Apply `severity_floor` filter last. |
+| 10 | Print report | (chat) | Output the report verbatim. End with the explicit `Files modified: 0` line and the next-step menu. |
+| 11 | Stop | (chat) | Do not propose `git commit`, do not chain into other skills. Wait for the user to decide. |
+
+## Diff classification rules
+
+Severity scale:
+
+| Severity | Meaning | Examples |
+|----------|---------|----------|
+| `error` | Doc is misleading — a reader following the doc will get wrong behaviour. | endpoint in doc returns `Result<Foo>` but code returns `PageResult<Foo>`; doc lists a column type `VARCHAR(64)` that DDL says `TEXT`. |
+| `warn` | Doc is incomplete — reader gets less than the truth. | new endpoint in code not listed in doc; new column in DDL not listed in doc. |
+| `info` | Doc is verbose / stale but harmless. | doc lists an endpoint whose path has since moved; doc still mentions a deprecated DO. |
+
+Auto-downgrade rules (avoid spam):
+
+- A controller method annotated `@Deprecated` → endpoint diffs against it are `info`, not `warn`.
+- A doc subsection inside `## 4.1 API 中存在但无对应单表的实体声明` → flagged
+  `TABLE_MISSING_IN_DDL` items here are downgraded to `info` (these are
+  in-memory / external by design).
+
+## Report format
+
+Single markdown report, sections in this fixed order:
+
+```markdown
+# Docs Drift Report
+
+_Generated by `docs-auto-sync` (read-only). Files modified: 0._
+
+**Scope**: api+data | **Domain**: admin+studio | **Since**: full scan | **Floor**: warn
+
+## Summary
+
+| Category | error | warn | info | total |
+|----------|------:|-----:|-----:|------:|
+| API: missing in doc        | 0 | 3 | 0 | 3 |
+| API: missing in code       | 0 | 1 | 2 | 3 |
+| API: signature mismatch    | 2 | 0 | 0 | 2 |
+| Data: table missing in doc | 0 | 1 | 0 | 1 |
+| Data: field mismatch       | 1 | 0 | 0 | 1 |
+| Entity ↔ DDL mismatch      | 0 | 2 | 0 | 2 |
+| **Total**                  | **3** | **7** | **2** | **12** |
+
+## 1. API endpoints
+
+### 1.1 Missing in docs/api-list.md (warn)
+
+- **`POST /api/dataset/version/diff`** — `DatasetController.diffVersion`, line 187
+  - suggested patch (paste manually, into §2 "数据集" of docs/api-list.md):
+    ```markdown
+    | POST | /api/dataset/version/diff | 比较两个数据集版本差异 |
+    ```
+
+### 1.2 Documented endpoints with no matching controller method (info / warn)
+
+- **`GET /api/legacy/foo`** — appears in docs/api-list.md L92, no matching method.
+  - Likely deleted in commit XXXXXXX (user can verify); remove the doc row.
+
+### 1.3 Signature mismatch (error)
+
+- **`GET /api/experiment/{id}`** — doc says returns `Result<Experiment>`, code returns `Result<ExperimentDetail>` (`ExperimentController.java:62`).
+
+## 2. Data model
+
+### 2.1 Tables in DDL but not in docs/data-model.md (warn)
+
+- **`workflow_run`** — defined in `admin-schema.sql:412`, missing from §2.
+  - suggested patch (paste manually, into §2):
+    ````markdown
+    ### 2.7 workflow_run（工作流运行实例）
+    | 字段 | SQL 类型 | 说明 |
+    |------|----------|------|
+    | id | BIGINT(20) UNSIGNED | 主键 |
+    | ... | ... | ... |
+    ````
+
+### 2.2 Field type mismatch (error)
+
+- Table `dataset_item`, column `content`:
+  - DDL: `LONGTEXT NOT NULL`
+  - doc/data-model.md L143: `TEXT`
+  - Recommendation: update doc to `LONGTEXT NOT NULL`.
+
+### 2.3 Entity ↔ DDL mismatch (warn)
+
+- `DatasetItemDO.tags` (java) ↔ DDL has no `tags` column on `dataset_item`.
+  - Either add a `tags` column + migration, or drop the field from the DO.
+
+## 3. Next steps for the human
+
+This skill made **0 file modifications**. Pick one:
+
+1. Apply the patches above by hand.
+2. Ask another skill (or a fresh chat) to apply them — explicitly say
+   "apply the docs-auto-sync report" so the agent has authorization.
+3. Ignore. If an item is intentional drift, add a one-line note in the
+   relevant doc so the next run downgrades it to `info`.
+```
+
+The actual numbers and entries above are illustrative — fill in real
+findings, omit empty sections, keep ordering stable so diffs across runs
+are reviewable.
+
+## Pitfalls to avoid
+
+- **Don't deep-diff request body shapes** at field granularity — it is too
+  noisy and the doc rarely tracks DTO refactors. Flag only the four
+  signature-mismatch cases listed in step 4(c).
+- **Don't normalise column types aggressively.** `DATETIME` vs `TIMESTAMP`
+  is a real difference; `BIGINT(20)` vs `BIGINT` is cosmetic. The
+  normalisation list in step 7(d) is intentionally short — extend only
+  when the user complains about false positives.
+- **Don't confuse the two domains.** Admin DOs live in `server-start/admin/entity`;
+  studio entities live in `server-core/.../core/base/entity`. Same class
+  simple name can exist in both domains and refer to different tables.
+- **Don't follow links into related skills.** If a finding looks like
+  `scaffold-resource` would fix it, mention the skill name in the report
+  but do not invoke it.
+- **Don't print a finding without a line number / file path.** The whole
+  point of this report is "go look here". A finding without a location is
+  noise.
+- **Don't suppress an empty section silently if `severity_floor` filtered
+  everything out.** Render it as `(no items at or above the current floor)`
+  so the user knows the audit ran.
+
+## When to re-run
+
+- After merging any PR that touches a `*Controller.java`,
+  `*DO.java` / `*Entity.java`, or `docker/middleware/init/mysql/*.sql`.
+- Before opening a PR that itself modifies `docs/api-list.md` or
+  `docs/data-model.md` — to make sure you are documenting reality and not
+  inventing it.
+- As a weekly hygiene check; the report is cheap (read-only), so cost of
+  running it is near zero.
